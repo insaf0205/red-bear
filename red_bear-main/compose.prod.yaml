@@ -1,0 +1,130 @@
+services:
+  web:
+    image: 'jc21/nginx-proxy-manager:latest'
+    restart: unless-stopped
+    ports:
+      - '443:443' # HTTPS наружу
+    volumes:
+      - ./docker/npm/data:/data
+      - ./docker/npm/letsencrypt:/etc/letsencrypt
+      # Монтируем public основного приложения, чтобы Nginx мог отдавать статику напрямую
+      - laravel-public-assets:/var/www/public:ro
+    networks:
+      - laravel-production
+    depends_on:
+      php-fpm:
+        condition: service_healthy
+
+
+  php-fpm:
+    build:
+      context: .
+      dockerfile: ./docker/common/php-fpm/Dockerfile
+      target: production
+    restart: unless-stopped
+    volumes:
+      # PHP-FPM записывает сюда файлы, а также генерирует манифесты
+      - laravel-public-assets:/var/www/public
+      - laravel-storage-production:/var/www/storage
+    env_file:
+      - .env
+    networks:
+      - laravel-production
+    healthcheck:
+      test: [ "CMD", "cgi-fcgi", "-bind", "-connect", "127.0.0.1:9000" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    user: postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_DB=${DB_DATABASE}
+      - POSTGRES_USER=${DB_USERNAME}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - postgres-data-production:/var/lib/postgresql/data
+    networks:
+      - laravel-production
+    # Health check for PostgreSQL
+    # -----------------------------------------------------------
+    # Health checks allow Docker to determine if a service is operational.
+    # The 'pg_isready' command checks if PostgreSQL is ready to accept connections.
+    # This prevents dependent services from starting before the database is ready.
+    # -----------------------------------------------------------
+    healthcheck:
+      test: [ "CMD", "pg_isready" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped  # Automatically restart unless the service is explicitly stopped
+    networks:
+      - laravel-production
+    # Health check for Redis
+    # -----------------------------------------------------------
+    # Checks if Redis is responding to the 'PING' command.
+    # This ensures that the service is not only running but also operational.
+    # -----------------------------------------------------------
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Платёжная система (plateshka): отдельное Laravel-приложение, тестовый платёжный шлюз.
+  # Основное приложение создаёт платёж по http://payment:8000/api/payments (внутри сети compose),
+  # пользователь оплачивает на http://localhost:${PAYMENT_PORT:-8080}/payments/{id}.
+  payment:
+    build:
+      context: ./plateshka
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${PAYMENT_PORT:-8080}:8000"
+    environment:
+      APP_NAME: Plateshka
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_URL: ${PAYMENT_PUBLIC_URL:-http://localhost:8080}
+      APP_KEY: ${PAYMENT_APP_KEY:?Задай PAYMENT_APP_KEY в .env (php artisan key:generate --show)}
+      DB_CONNECTION: sqlite
+      DB_DATABASE: /var/www/database/sqlite/database.sqlite
+      LOG_CHANNEL: stderr
+      SESSION_DRIVER: file
+      CACHE_DRIVER: file
+      QUEUE_CONNECTION: sync
+      PHP_CLI_SERVER_WORKERS: "4"
+    volumes:
+      - payment-data-production:/var/www/database/sqlite
+    networks:
+      - laravel-production
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:8000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+networks:
+  # Attach the service to the 'laravel' network.
+  # -----------------------------------------------------------
+  # This custom network allows all services within it to communicate using their service names as hostnames.
+  # For example, 'php-fpm' can connect to 'postgres' by using 'postgres' as the hostname.
+  # -----------------------------------------------------------
+  laravel-production:
+
+volumes:
+  postgres-data-production:
+  laravel-storage-production:
+  # Переименуем или оставим этот же volume, теперь он шарит весь public
+  laravel-public-assets:
+  payment-data-production:
